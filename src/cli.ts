@@ -7,7 +7,7 @@ import { renderMorningReport } from "./morning-report.js";
 import { parseNightRecord } from "./night-record.js";
 
 /**
- * `npm run report -- <path-to-record.json> [--force] [--dry-run]`
+ * `npm run report -- <path-to-record.json> [--force] [--dry-run] [--help]`
  *
  * Validates the record, prints the morning report, and writes it to
  * reports/<date>.md. On any problem it prints what is wrong, writes nothing,
@@ -22,9 +22,22 @@ import { parseNightRecord } from "./night-record.js";
  *   command is always a safe preview.
  */
 
-const USAGE = "Usage: npm run report -- <path-to-record.json> [--force] [--dry-run]\n";
+const USAGE = "Usage: npm run report -- <path-to-record.json> [--force] [--dry-run] [--help]\n";
 
-type Options = { recordPath: string; force: boolean; dryRun: boolean };
+const HELP =
+  USAGE +
+  "\n" +
+  "Validates a night record, prints the morning report, and writes it to reports/<date>.md.\n" +
+  "\n" +
+  "Options:\n" +
+  "  --force      Replace an existing report instead of refusing.\n" +
+  "  --dry-run    Print the report and write nothing (wins over --force).\n" +
+  "  --help, -h   Show this help and exit.\n" +
+  "\n" +
+  "Example:\n" +
+  "  npm run report -- fixtures/sample-escalated.json --dry-run\n";
+
+type Options = { recordPath: string; force: boolean; dryRun: boolean } | { help: true };
 
 /** Parse CLI arguments, or return a readable error message. */
 function parseOptions(args: string[]): Options | { error: string } {
@@ -34,19 +47,25 @@ function parseOptions(args: string[]): Options | { error: string } {
       args,
       allowPositionals: true,
       strict: true,
-      options: { force: { type: "boolean" }, "dry-run": { type: "boolean" } },
+      options: {
+        force: { type: "boolean" },
+        "dry-run": { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+      },
     });
   } catch (error) {
     const { code, message } = error as { code?: string; message: string };
     const option = /'(-[^']*)'/.exec(message)?.[1] ?? "";
     if (code === "ERR_PARSE_ARGS_UNKNOWN_OPTION") {
-      return { error: `Unknown option: ${option}. Known options: --force, --dry-run.\n${USAGE}` };
+      return { error: `Unknown option: ${option}. Known options: --force, --dry-run, --help.\n${USAGE}` };
     }
     if (code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE") {
       return { error: `Option ${option} does not take a value.\n${USAGE}` };
     }
     return { error: `${message}\n${USAGE}` };
   }
+
+  if (parsed.values.help === true) return { help: true };
 
   const [recordPath, ...extra] = parsed.positionals;
   if (!recordPath || extra.length > 0) return { error: USAGE };
@@ -92,6 +111,10 @@ export async function runReport(args: string[], io: CliIo): Promise<number> {
   if ("error" in options) {
     io.err(options.error);
     return 1;
+  }
+  if ("help" in options) {
+    io.out(HELP);
+    return 0;
   }
   const { recordPath, force, dryRun } = options;
 

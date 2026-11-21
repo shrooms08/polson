@@ -209,6 +209,37 @@ describe("report CLI", () => {
     });
   });
 
+  describe("--help", () => {
+    it.each([["--help"], ["-h"]])("%s prints usage, every option, and an example, exits 0", async (flag) => {
+      expect(await runReport([flag], io())).toBe(0);
+      expect(out).toContain("Usage: npm run report --");
+      expect(out).toMatch(/--force\s+\S/);
+      expect(out).toMatch(/--dry-run\s+\S/);
+      expect(out).toMatch(/--help, -h\s+\S/);
+      expect(out).toContain("Example:");
+      expect(err).toBe("");
+    });
+
+    it("-h prints exactly what --help prints", async () => {
+      await runReport(["--help"], io());
+      const long = out;
+      out = "";
+      await runReport(["-h"], io());
+      expect(out).toBe(long);
+    });
+
+    it("works without a record path and writes nothing", async () => {
+      expect(await runReport(["--help"], io())).toBe(0);
+      expect(existsSync(join(cwd, "reports"))).toBe(false);
+    });
+
+    it("writes nothing even when given a record path", async () => {
+      expect(await runReport([fixturePath("sample-escalated.json"), "--help"], io())).toBe(0);
+      expect(out).toContain("Example:");
+      expect(existsSync(join(cwd, "reports"))).toBe(false);
+    });
+  });
+
   describe("unknown or malformed options", () => {
     it.each([["--frce"], ["-f"], ["--overwrite"]])(
       "rejects the unknown option %s with exit 1 and writes nothing",
@@ -216,7 +247,7 @@ describe("report CLI", () => {
         const code = await runReport([fixturePath("sample-escalated.json"), flag], io());
 
         expect(code).toBe(1);
-        expect(err).toContain(`Unknown option: ${flag}. Known options: --force, --dry-run.`);
+        expect(err).toContain(`Unknown option: ${flag}. Known options: --force, --dry-run, --help.`);
         expect(err).toContain("Usage: npm run report --");
         expect(out).toBe("");
         expect(existsSync(join(cwd, "reports"))).toBe(false);
