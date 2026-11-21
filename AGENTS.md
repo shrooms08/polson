@@ -48,11 +48,18 @@ Polson is an AI co-founder that ships one verified improvement every night. Each
 
 ## Automation
 
-`.github/workflows/polson-agent.yml` runs the builder agent with the instructions in `.github/polson/agent-prompt.md`.
+`.github/workflows/polson-agent.yml` runs one ticket through scripted phases in a single job. The agent only does judgement work; scripts in `.github/polson/` do the waiting, the looping, and the label decision.
 
-- **Label flow:** a person adds `ready-for-agent`. The workflow swaps it to `agent-working`. The agent ends on `agent-done` (PR opened, a human decides) or `needs-human` (it stopped and explained why). If the job fails, times out, or ends with the issue still `agent-working`, the workflow swaps it to `needs-human` and comments with the run link. The next run does the same for any issue an earlier run left in `agent-working`.
-- **When:** as soon as `ready-for-agent` is added, and nightly at 02:17 Lagos time (01:17 UTC) for the oldest open `ready-for-agent` issue. One job runs at a time, for up to 60 minutes.
-- **Retry limit:** at most 2 fix rounds for review findings, then it escalates.
+- **Phases:**
+  1. **Resume:** if the agent already opened a PR from a branch named `<issue>-*`, reuse it and skip the build. A matching PR from anyone else goes to a person.
+  2. **Build (agent, `build-prompt.md`):** implement the ticket, run typecheck and tests, push with the default branch's copy of `push-branch.sh`, open the PR. No waiting.
+  3. **Wait (script, `wait-for-pr.sh`):** poll every 60 seconds, for up to 15 minutes, until both required CI checks have finished on the PR's head commit and Qodo has assessed that commit.
+  4. **Resolve (agent, `resolve-prompt.md`):** reproduce or trace each CI failure and Qodo finding, fix valid High or Medium ones, push at most once, and report on the issue.
+  5. **Finish (script):** `agent-done` only if CI is green, Qodo finished, and Qodo lists no open High or Medium finding. Otherwise `needs-human`, with the blocker in a comment.
+- **Qodo on bot PRs:** the agent's PRs are bot-authored, which Qodo skips by default; `.pr_agent.toml` turns that off.
+- **Retry limit:** wait and resolve repeat at most twice (2 fix rounds), then a last wait and finish. The workflow runs the rounds; the agent never loops.
+- **Label flow:** a person adds `ready-for-agent`. The workflow swaps it to `agent-working`, then ends on `agent-done` (a human decides) or `needs-human`. If a step fails or times out with the issue still `agent-working`, the workflow swaps it to `needs-human` and comments with the run link. The next run does the same for any issue an earlier run left in `agent-working`.
+- **When:** as soon as `ready-for-agent` is added, and nightly at 02:17 Lagos time (01:17 UTC) for the oldest open `ready-for-agent` issue. One job runs at a time, for up to 150 minutes; each phase has its own limit.
 - **Never merges:** the agent opens a PR and stops. A person decides what reaches main.
 
 ## Deferred issues

@@ -1,8 +1,22 @@
 # Lets Polson's agent pick up a ticket without anyone prompting it.
 #
-# Label flow: ready-for-agent -> agent-working -> agent-done (PR opened, a human
-# decides) or needs-human (the agent stopped and needs a person).
-# The agent's instructions live in .github/polson/agent-prompt.md.
+# Label flow: ready-for-agent -> agent-working -> agent-done (PR opened and every
+# check passed; a human decides) or needs-human (stopped and needs a person).
+#
+# Phases, all in one job. The agent only does judgement work; scripts wait, loop,
+# and decide the label. Scripts live in .github/polson/:
+#   resume  phase.sh find-pr: reuse an open PR the agent opened from a branch named
+#           <issue>-*. A matching PR opened by anyone else goes to a person.
+#   build   agent (build-prompt.md): implement, test, push, open the PR. No waiting.
+#   wait    phase.sh wait: wait-for-pr.sh polls CI and Qodo on the PR's head commit
+#           every 60 seconds for up to 15 minutes, then a gate picks the next phase.
+#   resolve agent (resolve-prompt.md): handle CI failures and Qodo findings, push
+#           at most once, and report on the issue.
+#   finish  phase.sh finish: agent-done only if CI is green, Qodo finished, and Qodo
+#           lists no open High or Medium finding; otherwise needs-human.
+# The wait and resolve pair runs at most twice (2 fix rounds), then a last wait.
+# Steps cannot loop, so the rounds are written out: wait0, resolve1, after1,
+# wait1, resolve2, after2, wait2, finish.
 #
 # claude-code-action only runs a workflow that is already on the default branch,
 # so this workflow can only be tested after it is merged.
@@ -33,17 +47,21 @@ concurrency:
 # The workflow token (GITHUB_TOKEN) gets only these permissions.
 permissions:
   # Required by the action's documented setup. The agent pushes its ticket branch
-  # with the Claude GitHub App token, which asks for contents: write itself.
+  # with the Claude GitHub App token, which asks for contents: write itself. The
+  # scripts use the workflow token only to fetch the PR branch.
   contents: write
   # Required by the action's documented setup, for opening and updating the PR.
+  # The scripts use it to read the PR and Qodo's comments.
   pull-requests: write
-  # The label swaps and failure comments below use the workflow token.
+  # The label swaps and the comments the scripts post use the workflow token.
   issues: write
   # Lets the action fetch a GitHub OIDC token and exchange it for the Claude
   # GitHub App token. Without it the action cannot authenticate to GitHub.
   id-token: write
   # Lets the agent read CI results for its PR (paired with additional_permissions).
   actions: read
+  # Lets the wait script read the CI check runs on the PR's head commit.
+  checks: read
 
 jobs:
   agent:
@@ -53,9 +71,20 @@ jobs:
       github.event_name != 'issues' ||
       (github.event.label.name == 'ready-for-agent' && github.event.sender.type == 'User')
     runs-on: ubuntu-latest
-    # Every step has its own limit, and the limits add up to 58 minutes, so the
-    # final hand-over step always starts before the job's 60 minutes run out.
-    timeout-minutes: 60
+    # Time budget. Every step has its own limit, and the limits add up to 145
+    # minutes, so the final hand-over step always starts before the job's 150
+    # minutes run out (the rest covers job setup and post steps).
+    #   setup: sweep 2, checkout 3, copy 1, Node 3, install 5, resolve 2,
+    #          prompt 1, mark 1, resume check 1                            = 19
+    #   build agent 25, after-build 2                                      = 27
+    #   3 waits x 17 (the script gives up after 15 minutes)                = 51
+    #   2 resolve agents x 20, 2 after-resolve x 2                         = 44
+    #   finish 1, hand-over 3                                              =  4
+    # Steps that are skipped take no time, so most runs are much shorter.
+    timeout-minutes: 150
+    env:
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       # Runs first and needs only gh, so a failed checkout or install cannot block it.
       # Only one job in the polson-agent group runs at a time, so an issue still
@@ -65,8 +94,6 @@ jobs:
         timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           stranded=$(gh issue list --state open --label agent-working --limit 1000 --json number --jq '.[].number')
@@ -89,6 +116,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # The scripts and prompts run from this copy of the default branch's files,
+      # so checking out a PR branch later cannot change them mid-run.
+      - name: Keep a copy of the scripts and prompts
+        timeout-minutes: 1
+        run: rm -rf "${{ runner.temp }}/polson" && cp -R .github/polson "${{ runner.temp }}/polson"
+
       - name: Set up Node 24
         timeout-minutes: 3
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -105,7 +138,6 @@ jobs:
         timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ISSUE: ${{ github.event.issue.number }}
           INPUT_ISSUE: ${{ inputs.issue_number }}
@@ -144,89 +176,217 @@ jobs:
           echo "Working on #$n"
           echo "number=$n" >> "$GITHUB_OUTPUT"
 
-      - name: Build the agent prompt
-        id: prompt
+      - name: Build the build-phase prompt
+        id: build_prompt
         if: steps.resolve.outputs.number != ''
         timeout-minutes: 1
         env:
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
-        run: |
-          set -euo pipefail
-          prompt=$(sed "s/{{ISSUE_NUMBER}}/$ISSUE_NUMBER/g" .github/polson/agent-prompt.md)
-          if grep -q '{{' <<<"$prompt"; then
-            echo "::error::The agent prompt still contains a {{...}} placeholder."
-            exit 1
-          fi
-          delimiter="POLSON_PROMPT_$(openssl rand -hex 16)"
-          {
-            echo "text<<$delimiter"
-            printf '%s\n' "$prompt"
-            echo "$delimiter"
-          } >> "$GITHUB_OUTPUT"
+        run: bash "${{ runner.temp }}/polson/phase.sh" build-prompt "$ISSUE_NUMBER"
 
       - name: Mark the issue agent-working
         if: steps.resolve.outputs.number != ''
         timeout-minutes: 1
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
         run: gh issue edit "$ISSUE_NUMBER" --remove-label ready-for-agent --add-label agent-working
 
-      - name: Run the agent
-        id: agent
+      # Phase: resume. An earlier run may have opened the PR already.
+      - name: "Resume check: reuse an open PR for this issue"
+        id: existing
         if: steps.resolve.outputs.number != ''
-        # 38 of the job's 60 minutes; see the note on timeout-minutes above.
-        timeout-minutes: 38
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" find-pr "$ISSUE_NUMBER"
+
+      # Agent tool rules, for every agent step below:
+      # --permission-mode default: deny every tool call that --allowedTools does
+      # not cover, instead of letting auto mode's safety review decide.
+      # No WebFetch, WebSearch, curl or similar: only gh and npm reach the network.
+      # No `gh api`: it can call any endpoint, including merge and file writes.
+      # No sleep: the agent never waits; the wait steps do.
+      # The agent never runs git push. It runs the default branch's copy of
+      # push-branch.sh (in runner.temp, not the checked-out file, which a PR branch
+      # could replace) with its own issue number. That pushes the current branch to
+      # the branch of the same name, and only if it is a ticket branch (<issue>-<slug>).
+      # These rules narrow what the agent is asked and allowed to run. They are
+      # not a sandbox: code the agent runs (npm test) holds the same token. Only
+      # GitHub-side rules on main (the protect-main ruleset) can enforce "never
+      # merge, never push to main" against that token.
+
+      # Phase: build.
+      - name: "Build: the agent implements the ticket and opens a PR"
+        id: build
+        if: steps.existing.outputs.next == 'build'
+        timeout-minutes: 25
         uses: anthropics/claude-code-action@acfe7992852970efb4fee683d63d628e3e52df67 # v1.0.286
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: ${{ steps.prompt.outputs.text }}
+          prompt: ${{ steps.build_prompt.outputs.prompt }}
           additional_permissions: |
             actions: read
-          # --permission-mode default: deny every tool call that --allowedTools does
-          # not cover, instead of letting auto mode's safety review decide.
-          # No WebFetch, WebSearch, curl or similar: only gh and npm reach the network.
-          # No `gh api`: it can call any endpoint, including merge and file writes.
-          # The agent never runs git push. It runs .github/polson/push-branch.sh with
-          # its own issue number, which pushes the current branch to the branch of the
-          # same name, and only if that is a ticket branch (<issue>-<slug>).
-          # These rules narrow what the agent is asked and allowed to run. They are
-          # not a sandbox: code the agent runs (npm test) holds the same token. Only
-          # GitHub-side rules on main (a ruleset) can enforce "never merge, never
-          # push to main" against that token.
           claude_args: |
             --permission-mode default
-            --max-turns 200
-            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(npm ci),Bash(npm install),Bash(npm test),Bash(npm test:*),Bash(npm run typecheck),Bash(npm run report:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(git checkout:*),Bash(git switch:*),Bash(git restore:*),Bash(git add:*),Bash(git commit:*),Bash(bash .github/polson/push-branch.sh ${{ steps.resolve.outputs.number }}),Bash(git pull:*),Bash(git fetch:*),Bash(git rev-parse:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh run list:*),Bash(gh run view:*),Bash(sleep:*)"
-            --disallowedTools "WebFetch,WebSearch,Bash(gh api:*),Bash(gh pr merge:*),Bash(git merge:*),Bash(git push:*),Edit(./.github/**),Write(./.github/**)"
+            --max-turns 150
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(npm ci),Bash(npm install),Bash(npm test),Bash(npm test:*),Bash(npm run typecheck),Bash(npm run report:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(git checkout:*),Bash(git switch:*),Bash(git restore:*),Bash(git add:*),Bash(git commit:*),Bash(bash ${{ runner.temp }}/polson/push-branch.sh ${{ steps.resolve.outputs.number }}),Bash(git pull:*),Bash(git fetch:*),Bash(git rev-parse:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*),Bash(gh pr create:*),Bash(gh pr view:*)"
+            --disallowedTools "WebFetch,WebSearch,Bash(gh api:*),Bash(gh pr merge:*),Bash(git merge:*),Bash(git push:*),Bash(sleep:*),Edit(./.github/**),Write(./.github/**)"
 
-      - name: Hand over to a person if the agent did not finish
+      - name: "Build: find the PR the agent opened"
+        id: built
+        if: steps.existing.outputs.next == 'build'
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+          AGENT_CONCLUSION: ${{ steps.build.outputs.conclusion }}
+          AGENT_SKIPPED: ${{ steps.build.outputs.skipped_due_to_workflow_validation_mismatch }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" after-build "$ISSUE_NUMBER"
+
+      # Phase: wait (round 0), then resolve round 1.
+      - name: "Wait for CI and Qodo (before round 1)"
+        id: wait0
+        if: steps.existing.outputs.next == 'wait' || steps.built.outputs.next == 'wait'
+        timeout-minutes: 17
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+          PR: ${{ steps.built.outputs.pr || steps.existing.outputs.pr }}
+          BRANCH: ${{ steps.built.outputs.branch || steps.existing.outputs.branch }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" wait "$ISSUE_NUMBER" 0
+
+      - name: "Resolve round 1: the agent handles CI and Qodo results"
+        id: resolve1
+        if: steps.wait0.outputs.next == 'resolve'
+        timeout-minutes: 20
+        uses: anthropics/claude-code-action@acfe7992852970efb4fee683d63d628e3e52df67 # v1.0.286
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.wait0.outputs.prompt }}
+          additional_permissions: |
+            actions: read
+          # Keep identical to resolve round 2.
+          claude_args: |
+            --permission-mode default
+            --max-turns 100
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(npm ci),Bash(npm install),Bash(npm test),Bash(npm test:*),Bash(npm run typecheck),Bash(npm run report:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git restore:*),Bash(git add:*),Bash(git commit:*),Bash(bash ${{ runner.temp }}/polson/push-branch.sh ${{ steps.resolve.outputs.number }}),Bash(git rev-parse:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh run view:*),Bash(gh run list:*)"
+            --disallowedTools "WebFetch,WebSearch,Bash(gh api:*),Bash(gh pr merge:*),Bash(git merge:*),Bash(git push:*),Bash(sleep:*),Edit(./.github/**),Write(./.github/**)"
+
+      - name: "After round 1: did the agent push a fix?"
+        id: after1
+        if: steps.wait0.outputs.next == 'resolve'
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+          PR: ${{ steps.wait0.outputs.pr }}
+          HEAD_BEFORE: ${{ steps.wait0.outputs.head_sha }}
+          AGENT_CONCLUSION: ${{ steps.resolve1.outputs.conclusion }}
+          AGENT_SKIPPED: ${{ steps.resolve1.outputs.skipped_due_to_workflow_validation_mismatch }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" after-resolve "$ISSUE_NUMBER" 1
+
+      # Phase: wait (round 1), then resolve round 2.
+      - name: "Wait for CI and Qodo (before round 2)"
+        id: wait1
+        if: steps.after1.outputs.next == 'wait'
+        timeout-minutes: 17
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+          PR: ${{ steps.wait0.outputs.pr }}
+          BRANCH: ${{ steps.wait0.outputs.branch }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" wait "$ISSUE_NUMBER" 1
+
+      - name: "Resolve round 2: the agent handles CI and Qodo results"
+        id: resolve2
+        if: steps.wait1.outputs.next == 'resolve'
+        timeout-minutes: 20
+        uses: anthropics/claude-code-action@acfe7992852970efb4fee683d63d628e3e52df67 # v1.0.286
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.wait1.outputs.prompt }}
+          additional_permissions: |
+            actions: read
+          # Keep identical to resolve round 1.
+          claude_args: |
+            --permission-mode default
+            --max-turns 100
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(npm ci),Bash(npm install),Bash(npm test),Bash(npm test:*),Bash(npm run typecheck),Bash(npm run report:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git restore:*),Bash(git add:*),Bash(git commit:*),Bash(bash ${{ runner.temp }}/polson/push-branch.sh ${{ steps.resolve.outputs.number }}),Bash(git rev-parse:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh run view:*),Bash(gh run list:*)"
+            --disallowedTools "WebFetch,WebSearch,Bash(gh api:*),Bash(gh pr merge:*),Bash(git merge:*),Bash(git push:*),Bash(sleep:*),Edit(./.github/**),Write(./.github/**)"
+
+      - name: "After round 2: did the agent push a fix?"
+        id: after2
+        if: steps.wait1.outputs.next == 'resolve'
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+          PR: ${{ steps.wait1.outputs.pr }}
+          HEAD_BEFORE: ${{ steps.wait1.outputs.head_sha }}
+          AGENT_CONCLUSION: ${{ steps.resolve2.outputs.conclusion }}
+          AGENT_SKIPPED: ${{ steps.resolve2.outputs.skipped_due_to_workflow_validation_mismatch }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" after-resolve "$ISSUE_NUMBER" 2
+
+      # Phase: last wait. Both fix rounds are used, so its gate always finishes.
+      - name: "Wait for CI and Qodo (after round 2)"
+        id: wait2
+        if: steps.after2.outputs.next == 'wait'
+        timeout-minutes: 17
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+          PR: ${{ steps.wait1.outputs.pr }}
+          BRANCH: ${{ steps.wait1.outputs.branch }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" wait "$ISSUE_NUMBER" 2
+
+      # Phase: finish, from the latest wait's results (a skipped wait has none).
+      - name: "Finish: agent-done or needs-human"
+        id: finish
+        if: >-
+          steps.after1.outputs.next == 'finish' ||
+          steps.after2.outputs.next == 'finish' ||
+          steps.wait2.outputs.next == 'finish'
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
+          PR: ${{ steps.wait2.outputs.pr || steps.wait1.outputs.pr || steps.wait0.outputs.pr }}
+          HEAD_SHA: ${{ steps.wait2.outputs.head_sha || steps.wait1.outputs.head_sha || steps.wait0.outputs.head_sha }}
+          CI: ${{ steps.wait2.outputs.ci || steps.wait1.outputs.ci || steps.wait0.outputs.ci }}
+          CI_DETAIL: ${{ steps.wait2.outputs.ci_detail || steps.wait1.outputs.ci_detail || steps.wait0.outputs.ci_detail }}
+          QODO: ${{ steps.wait2.outputs.qodo || steps.wait1.outputs.qodo || steps.wait0.outputs.qodo }}
+          QODO_OPEN: ${{ steps.wait2.outputs.qodo_open || steps.wait1.outputs.qodo_open || steps.wait0.outputs.qodo_open }}
+          FIXED1: ${{ steps.after1.outputs.fixed }}
+          FIXED2: ${{ steps.after2.outputs.fixed }}
+        run: bash "${{ runner.temp }}/polson/phase.sh" finish "$ISSUE_NUMBER"
+
+      - name: Hand over to a person if the run did not finish
         # Runs even when an earlier step failed, timed out, or was cancelled.
         if: always() && steps.resolve.outputs.number != ''
         timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ steps.resolve.outputs.number }}
           JOB_STATUS: ${{ job.status }}
-          AGENT_OUTCOME: ${{ steps.agent.outcome }}
-          SKIPPED: ${{ steps.agent.outputs.skipped_due_to_workflow_validation_mismatch }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STEPS: >-
+            build: ${{ steps.build.outcome || 'not run' }},
+            resolve round 1: ${{ steps.resolve1.outcome || 'not run' }},
+            resolve round 2: ${{ steps.resolve2.outcome || 'not run' }}
         run: |
           set -euo pipefail
           labels=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '.labels[].name')
           if ! grep -qx 'agent-working' <<<"$labels"; then
-            echo "The issue is no longer agent-working; the agent handed it over itself."
+            echo "The issue is no longer agent-working; it was already handed over."
             exit 0
           fi
 
           if [ "$JOB_STATUS" != "success" ]; then
-            why="The agent job ended with status \`$JOB_STATUS\` (agent step: \`${AGENT_OUTCOME:-not run}\`). It failed, timed out, or was cancelled."
-          elif [ "$SKIPPED" = "true" ]; then
-            why="The agent did not run: claude-code-action skipped it because this workflow does not match the copy on the default branch."
+            why="The agent job ended with status \`$JOB_STATUS\` ($STEPS). A step failed, timed out, or was cancelled."
           else
-            why="The agent step finished without moving the issue to agent-done or needs-human."
+            why="The run finished without moving the issue to agent-done or needs-human ($STEPS)."
           fi
 
           # Comment first. If the comment fails, the issue stays agent-working, this

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Pushes the current branch for Polson's agent. The agent may run only
-# `bash .github/polson/push-branch.sh <issue>`, with its own issue number, so it
-# never chooses the destination: this script pushes the current branch to the
+# `bash <runner.temp>/polson/push-branch.sh <issue>`, the workflow's copy of this
+# file from the default branch, with its own issue number, so it never chooses
+# the destination: this script pushes the current branch to the
 # branch of the same name, and only if that name is a ticket branch for <issue>.
 set -euo pipefail
 
 issue="${1:-}"
 if ! [[ "$issue" =~ ^[1-9][0-9]{0,9}$ ]]; then
-  echo "Usage: bash .github/polson/push-branch.sh <issue-number>" >&2
+  echo "Usage: bash push-branch.sh <issue-number>" >&2
   exit 2
 fi
 

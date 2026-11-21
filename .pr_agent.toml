@@ -1,0 +1,9 @@
+# Qodo configuration. Qodo reads this file from the default branch.
+#
+# Polson's builder agent opens its pull requests as a GitHub App (a bot account),
+# and by default Qodo does not review pull requests opened by bots. The scripted
+# finish in .github/workflows/polson-agent.yml waits for Qodo's review, so let
+# Qodo review bot-authored pull requests. Documented at
+# https://docs.qodo.ai/code-review/ignore-content-from-analysis
+[github_app]
+ignore_bot_pr = false
