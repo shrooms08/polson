@@ -8,6 +8,7 @@ Polson is an AI co-founder that ships one verified improvement every night. Each
 
 - Node: 20.19+, 22.12+, or 24+
 - Install: `npm install`
+- Tests also need `bash` and `jq` on PATH (`test/find-pr.test.ts` runs `.github/polson/phase.sh`)
 - Typecheck: `npm run typecheck`
 - Tests: `npm test`
 - Render a sample morning report: `npm run report -- fixtures/sample-escalated.json --dry-run` (`--dry-run` writes nothing; without it, an existing report is never replaced unless you pass `--force`)

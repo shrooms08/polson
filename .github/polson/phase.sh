@@ -93,14 +93,24 @@ write_prompt() {
 # branch in this repository, or nothing. Returns 3 if there is more than one,
 # and 4 if the one PR was not opened by the agent: its branch could carry code
 # nobody reviewed, and resuming it would run that code with the agent's token.
+#
+# One jq call finds the matching PRs and counts them: its first line is the
+# count, and each further line is "<number> <branch> <author>". A count that is
+# not a whole number (jq failed, or gh printed nothing, which jq turns into no
+# output at all) returns 1 instead of being read as "no PR" (AGENTS.md rule 6).
 find_pr() {
-  local list found count
+  local list result count found
   list=$(gh_ pr list --state open --base main --limit 200 \
     --json number,headRefName,isCrossRepository,author) || return 1
-  found=$(jq -r --arg re "$branch_re" \
-    '.[] | select(.isCrossRepository | not) | select(.headRefName | test($re)) | "\(.number) \(.headRefName) \(.author.login)"' \
-    <<<"$list") || return 1
-  count=$(grep -c . <<<"$found" || true)
+  result=$(jq -r --arg re "$branch_re" '
+    [.[] | select(.isCrossRepository | not) | select(.headRefName | test($re))
+         | "\(.number) \(.headRefName) \(.author.login)"]
+    | (length | tostring), .[]' <<<"$list") || return 1
+  { IFS= read -r count; found=$(cat); } <<<"$result"
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    echo "Could not count the open PRs for #$issue: gh pr list returned no readable list." >&2
+    return 1
+  fi
   if [ "$count" -gt 1 ]; then
     echo "More than one open PR comes from a ticket branch for #$issue: $(tr '\n' ' ' <<<"$found")" >&2
     return 3

@@ -24,4 +24,5 @@ write never leaves a partial report. Writing without `--force` needs a filesyste
 (APFS, ext4, NTFS); on exFAT or FAT32 it stops with a clear error and writes nothing. An invalid record or unknown option prints the problem and exits 1.
 The records in `fixtures/` are samples, not real nights.
 
-Other commands: `npm test`, `npm run typecheck`.
+Other commands: `npm test`, `npm run typecheck`. `npm test` also needs `bash` and `jq` on PATH,
+because it runs one of the automation scripts in `.github/polson/`.
