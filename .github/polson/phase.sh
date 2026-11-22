@@ -106,13 +106,24 @@ find_pr() {
     [.[] | select(.isCrossRepository | not) | select(.headRefName | test($re))
          | "\(.number) \(.headRefName) \(.author.login)"]
     | (length | tostring), .[]' <<<"$list") || return 1
-  { IFS= read -r count; found=$(cat); } <<<"$result"
+  # Split with bash's own parameter expansion: no external command that could
+  # fail silently and leave the PR lines empty while the count still reads.
+  count=${result%%$'\n'*}
+  found=""
+  if [ "$result" != "$count" ]; then found=${result#*$'\n'}; fi
   if ! [[ "$count" =~ ^[0-9]+$ ]]; then
     echo "Could not count the open PRs for #$issue: gh pr list returned no readable list." >&2
     return 1
   fi
+  # The PR lines must match jq's count. Anything else is unknown, not "no PR".
+  local lines=0 joined=${found//$'\n'/}
+  if [ -n "$found" ]; then lines=$(( ${#found} - ${#joined} + 1 )); fi
+  if [ "$lines" -ne "$count" ]; then
+    echo "Could not read the open PRs for #$issue: jq counted $count but $lines PR line(s) arrived." >&2
+    return 1
+  fi
   if [ "$count" -gt 1 ]; then
-    echo "More than one open PR comes from a ticket branch for #$issue: $(tr '\n' ' ' <<<"$found")" >&2
+    echo "More than one open PR comes from a ticket branch for #$issue: ${found//$'\n'/ }" >&2
     return 3
   fi
   if [ -n "$found" ] && [ "${found##* }" != "$agent_login" ]; then

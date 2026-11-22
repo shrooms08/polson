@@ -9,7 +9,7 @@
 // next=build or next=wait, 3 and 4 -> an escalation (comment, then needs-human),
 // 1 -> the command exits 1.
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -75,8 +75,17 @@ describe("find_pr (phase.sh find-pr)", () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  /** Runs `phase.sh find-pr 9` with `gh pr list` printing `listOutput`. */
-  function findPr(listOutput: string, listExit = 0) {
+  /**
+   * Runs `phase.sh find-pr 9` with `gh pr list` printing `listOutput`. `extraBin`
+   * adds more stand-in commands (name -> script) ahead of everything else on PATH.
+   */
+  function findPr(listOutput: string, listExit = 0, extraBin: Record<string, string> = {}) {
+    const extra = join(dir, "extra-bin");
+    mkdirSync(extra, { recursive: true });
+    for (const [name, body] of Object.entries(extraBin)) {
+      writeFileSync(join(extra, name), body);
+      chmodSync(join(extra, name), 0o755);
+    }
     const list = join(dir, "pr-list.json");
     const log = join(dir, "gh.log");
     const outputs = join(dir, "github-output");
@@ -86,7 +95,7 @@ describe("find_pr (phase.sh find-pr)", () => {
     const result = spawnSync("bash", [PHASE, "find-pr", "9"], {
       encoding: "utf8",
       env: {
-        PATH: `${dir}:${process.env.PATH ?? ""}`,
+        PATH: `${extra}:${dir}:${process.env.PATH ?? ""}`,
         GH_REPO: "owner/repo",
         GITHUB_OUTPUT: outputs,
         RUN_URL: "https://example.invalid/run",
@@ -143,6 +152,42 @@ describe("find_pr (phase.sh find-pr)", () => {
     expect(run.outputs).toBe("next=stop\n");
     expect(run.escalated).toBe(true);
     expect(run.relabelled).toBe(true);
+  });
+
+  // Qodo on PR #20: if reading the PR lines out of jq's output fails while the
+  // count still reads fine, the step must not decide there is no PR and build a
+  // duplicate.
+  describe("a lost PR line never becomes \"no PR\"", () => {
+    const AGENT_PR = JSON.stringify([pr(11, "9-add-help-report-cli", "app/claude")]);
+    const realPath = (command: string) =>
+      spawnSync("bash", ["-c", `command -v ${command}`], { encoding: "utf8" }).stdout.trim();
+
+    it("returns 1 when the PR lines are lost after the count", () => {
+      // jq still counts 1 PR, but only the count line reaches find_pr.
+      const jq = `#!/usr/bin/env bash
+out=$("${realPath("jq")}" "$@") || exit $?
+printf '%s\\n' "\${out%%$'\\n'*}"
+`;
+      const run = findPr(AGENT_PR, 0, { jq });
+
+      expect(run.status).toBe(1);
+      expect(run.stderr).not.toContain("building");
+      expect(run.outputs).toBe("");
+      expect(run.escalated).toBe(false);
+    });
+
+    it("does not build when cat fails to read stdin", () => {
+      // The failure Qodo described: \`cat\` with no arguments fails. (With file
+      // arguments, as the stand-in gh uses it, it still works.)
+      const cat = `#!/usr/bin/env bash
+if [ $# -eq 0 ]; then echo "cat: read error" >&2; exit 1; fi
+exec "${realPath("cat")}" "$@"
+`;
+      const run = findPr(AGENT_PR, 0, { cat });
+
+      expect(run.stderr).not.toContain("building");
+      expect(run.outputs).not.toContain("next=build");
+    });
   });
 
   describe("a failed count returns 1: the step fails, nothing is guessed or escalated", () => {
