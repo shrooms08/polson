@@ -194,7 +194,7 @@ describe("NightRecord schema", () => {
   it("rejects an unknown outcome", () => {
     const record = { ...loadRawFixture("sample-shipped.json"), outcome: "done" };
     expect(problemsFor(record)).toContain(
-      'outcome: must be "shipped", "blocked", or "escalated"',
+      'outcome: must be "shipped", "awaiting_merge", "blocked", or "escalated"',
     );
   });
 
@@ -211,5 +211,56 @@ describe("NightRecord schema", () => {
         "date: must be a real calendar date in YYYY-MM-DD format",
       ]),
     );
+  });
+});
+
+// Gap 4: awaiting_merge claims verification like shipped, so it gets the same
+// rules (AGENTS.md rule 1), and runs[] is checked like the rest of the record.
+describe("NightRecord schema: awaiting_merge and runs", () => {
+  const SHA = "ab55eb829aac4b6585ce2eb66adefb444efff6c8";
+  const awaiting = (): Record<string, unknown> => ({
+    ...loadRawFixture("sample-shipped.json"),
+    outcome: "awaiting_merge",
+    pullRequest: { number: 52, url: "https://github.com/shrooms08/polson/pull/52", headSha: SHA },
+    runs: [{ id: 45422221223, url: "https://github.com/shrooms08/polson/actions/runs/45422221223", headSha: SHA, endedLabel: "agent-done" }],
+  });
+
+  it("accepts a verified awaiting_merge record with runs", () => {
+    expect(parseNightRecord(awaiting()).ok).toBe(true);
+  });
+
+  it("rejects awaiting_merge with no review and no checks", () => {
+    const record: Record<string, unknown> = { ...awaiting(), checks: [] };
+    delete record.review;
+    expect(problemsFor(record)).toEqual([
+      'review: is required when outcome is "awaiting_merge" (an approved review)',
+      'checks: must include at least one check when outcome is "awaiting_merge"',
+    ]);
+  });
+
+  it("rejects awaiting_merge with a failed check or a review that requested changes", () => {
+    const record = awaiting();
+    const checks = (record.checks as { name: string; status: string }[]).map((check, i) => (i === 0 ? { ...check, status: "fail" } : check));
+    const review = { ...(record.review as object), verdict: "changes_requested" };
+    const problems = problemsFor({ ...record, checks, review });
+
+    expect(problems).toContain(`checks.0.status: outcome cannot be "awaiting_merge" while check "${checks[0]!.name}" failed`);
+    expect(problems).toContain('review.verdict: outcome cannot be "awaiting_merge" while the reviewer requested changes');
+  });
+
+  it("rejects a run with a bad URL, SHA or label, and a short pull request SHA", () => {
+    const record = awaiting();
+    const problems = problemsFor({
+      ...record,
+      pullRequest: { ...(record.pullRequest as object), headSha: "ab55eb8" },
+      runs: [{ id: 1, url: "javascript:alert(1)", headSha: "nope", endedLabel: "agent-working" }],
+    });
+
+    expect(problems).toEqual([
+      "pullRequest.headSha: must be a full 40-character commit SHA",
+      "runs.0.url: must be a valid http or https URL",
+      "runs.0.headSha: must be a full 40-character commit SHA",
+      'runs.0.endedLabel: must be "agent-done" or "needs-human"',
+    ]);
   });
 });

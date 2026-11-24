@@ -5,8 +5,8 @@ import { z } from "zod";
  * and checked, and what happened in the end.
  *
  * The schema enforces the product's core promise: a record can only say
- * "shipped" if it was verified, meaning an approved review and at least one
- * check, with every check passing.
+ * "shipped" (or "awaiting_merge") if it was verified, meaning an approved
+ * review and at least one check, with every check passing.
  *
  * Error messages are written to follow the field path, e.g.
  * `reason: is required when outcome is "blocked"`.
@@ -59,15 +59,33 @@ const TaskSchema = z.strictObject(
   { error: "is required" },
 );
 
+// Only http(s) links reach the report. `normalize` stores the parsed href,
+// which is percent-encoded and cannot contain whitespace, "<" or ">".
+const HttpUrl = z.url({
+  protocol: /^https?$/,
+  normalize: true,
+  error: "must be a valid http or https URL",
+});
+
+const CommitSha = z
+  .string({ error: "must be text" })
+  .regex(/^[0-9a-f]{40}$/, "must be a full 40-character commit SHA");
+
 const PullRequestSchema = z.strictObject({
   number: z.number({ error: "must be a number" }).int().positive("must be a positive integer"),
-  // Only http(s) links reach the report. `normalize` stores the parsed href,
-  // which is percent-encoded and cannot contain whitespace, "<" or ">".
-  url: z.url({
-    protocol: /^https?$/,
-    normalize: true,
-    error: "must be a valid http or https URL",
-  }),
+  url: HttpUrl,
+  /** The head commit the review and checks describe. */
+  headSha: CommitSha.optional(),
+});
+
+/** One agent run for the task, as the workflow recorded it on GitHub. */
+const RunSchema = z.strictObject({
+  id: z.number({ error: "must be a number" }).int().positive("must be a positive integer"),
+  url: HttpUrl,
+  /** The pull request's head commit when the run ended. */
+  headSha: CommitSha,
+  /** The label the run left on the issue. */
+  endedLabel: z.enum(["agent-done", "needs-human"], { error: 'must be "agent-done" or "needs-human"' }),
 });
 
 const reviewShape = {
@@ -92,28 +110,42 @@ const commonFields = {
   pullRequest: PullRequestSchema.optional(),
   review: ReviewSchema.optional(),
   checks: z.array(CheckSchema, { error: "is required (use [] if no checks ran)" }),
+  runs: z.array(RunSchema, { error: "must be a list of runs" }).optional(),
 };
 
-const SHIPPED_NEEDS_REVIEW = 'is required when outcome is "shipped" (an approved review)';
-const SHIPPED_NEEDS_CHECKS = 'must include at least one check when outcome is "shipped"';
+/**
+ * The outcomes that claim the work was verified: "shipped" (a person merged it)
+ * and "awaiting_merge" (every check passed and the review approved it; a person
+ * decides). Both need an approved review and at least one check, every check
+ * passing. Never loosen this (AGENTS.md rule 1).
+ */
+const VERIFIED_OUTCOMES = ["shipped", "awaiting_merge"] as const;
+type VerifiedOutcome = (typeof VERIFIED_OUTCOMES)[number];
 
-// "Shipped" means verified. Requiring the review and a non-empty checks list
-// here, in the base schema, means both are reported together even when both
-// fields are absent. (A refinement alone would be skipped once the base parse
-// fails, hiding the second problem.)
-const ShippedRecord = z.strictObject({
-  ...commonFields,
-  review: z.strictObject(reviewShape, {
-    error: (issue) =>
-      issue.code === "invalid_type" && issue.input === undefined ? SHIPPED_NEEDS_REVIEW : undefined,
-  }),
-  checks: z
-    .array(CheckSchema, {
-      error: (issue) => (issue.input === undefined ? SHIPPED_NEEDS_CHECKS : "must be a list of checks"),
-    })
-    .min(1, SHIPPED_NEEDS_CHECKS),
-  outcome: z.literal("shipped"),
-});
+// Requiring the review and a non-empty checks list here, in the base schema,
+// means both are reported together even when both fields are absent. (A
+// refinement alone would be skipped once the base parse fails, hiding the
+// second problem.)
+function verifiedRecord<O extends VerifiedOutcome>(outcome: O) {
+  const needsReview = `is required when outcome is "${outcome}" (an approved review)`;
+  const needsChecks = `must include at least one check when outcome is "${outcome}"`;
+  return z.strictObject({
+    ...commonFields,
+    review: z.strictObject(reviewShape, {
+      error: (issue) =>
+        issue.code === "invalid_type" && issue.input === undefined ? needsReview : undefined,
+    }),
+    checks: z
+      .array(CheckSchema, {
+        error: (issue) => (issue.input === undefined ? needsChecks : "must be a list of checks"),
+      })
+      .min(1, needsChecks),
+    outcome: z.literal(outcome),
+  });
+}
+
+const ShippedRecord = verifiedRecord("shipped");
+const AwaitingMergeRecord = verifiedRecord("awaiting_merge");
 
 const BlockedRecord = z.strictObject({
   ...commonFields,
@@ -128,15 +160,23 @@ const EscalatedRecord = z.strictObject({
   questionForHuman: requiredText('is required when outcome is "escalated"'),
 });
 
+function verifiedOutcomeOf(value: unknown): VerifiedOutcome | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const outcome = (value as { outcome?: unknown }).outcome;
+  return VERIFIED_OUTCOMES.find((verified) => verified === outcome);
+}
+
 export const NightRecordSchema = z
-  .discriminatedUnion("outcome", [ShippedRecord, BlockedRecord, EscalatedRecord], {
-    error: 'must be "shipped", "blocked", or "escalated"',
+  .discriminatedUnion("outcome", [ShippedRecord, AwaitingMergeRecord, BlockedRecord, EscalatedRecord], {
+    error: 'must be "shipped", "awaiting_merge", "blocked", or "escalated"',
   })
   .superRefine(
     (parsed, ctx) => {
-      // This runs for every shipped record, even one with other problems, so a
-      // failing check or rejected review is never hidden behind, say, a missing
-      // field. Fields may therefore be absent or only partly parsed here.
+      // This runs for every shipped or awaiting_merge record, even one with
+      // other problems, so a failing check or rejected review is never hidden
+      // behind, say, a missing field. Fields may therefore be absent or only
+      // partly parsed here.
+      const outcome = verifiedOutcomeOf(parsed) ?? "shipped";
       const record = parsed as {
         checks?: unknown;
         review?: { verdict?: unknown } | undefined;
@@ -148,7 +188,7 @@ export const NightRecordSchema = z
           ctx.addIssue({
             code: "custom",
             path: ["checks", index, "status"],
-            message: `outcome cannot be "shipped" while check "${String(check.name)}" failed`,
+            message: `outcome cannot be "${outcome}" while check "${String(check.name)}" failed`,
           });
         }
       });
@@ -157,16 +197,11 @@ export const NightRecordSchema = z
         ctx.addIssue({
           code: "custom",
           path: ["review", "verdict"],
-          message: 'outcome cannot be "shipped" while the reviewer requested changes',
+          message: `outcome cannot be "${outcome}" while the reviewer requested changes`,
         });
       }
     },
-    {
-      when: (payload) =>
-        typeof payload.value === "object" &&
-        payload.value !== null &&
-        (payload.value as { outcome?: unknown }).outcome === "shipped",
-    },
+    { when: (payload) => verifiedOutcomeOf(payload.value) !== undefined },
   );
 
 export type NightRecord = z.infer<typeof NightRecordSchema>;
