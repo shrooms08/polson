@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { renderMorningReport } from "../src/morning-report.js";
-import { loadRecord } from "./fixtures.js";
+import { renderMorningReport, renderNightDigest } from "../src/morning-report.js";
+import { parseNightRecord, type NightRecord } from "../src/night-record.js";
+import { loadRawFixture, loadRecord } from "./fixtures.js";
 
 describe("renderMorningReport", () => {
   it("reports a shipped night", () => {
@@ -156,5 +157,71 @@ describe("renderMorningReport", () => {
       expect(second).toBe(first);
       expect(fromFreshCopy).toBe(first);
     });
+  });
+});
+
+describe("renderNightDigest", () => {
+  const SHA = "ab55eb829aac4b6585ce2eb66adefb444efff6c8";
+  const context = {
+    date: "2026-11-24",
+    generatedAt: new Date("2026-11-24T16:00:00Z"),
+    since: new Date("2026-11-24T00:00:00Z"),
+    until: new Date("2026-11-24T15:20:00Z"),
+    unknowns: [
+      { issue: { number: 9, title: "Something # odd" }, runs: [{ id: 7, url: "https://github.com/o/r/actions/runs/7" }], missing: ['no "Node 24" check run on ab55eb8'] },
+    ],
+    idleRuns: [{ id: 8, url: "https://github.com/o/r/actions/runs/8" }],
+  };
+  /** A sample fixture with edits, validated like any record. */
+  const variant = (name: string, edits: Record<string, unknown>): NightRecord => {
+    const raw = loadRawFixture(name);
+    const parsed = parseNightRecord({ ...raw, ...edits, task: { ...(raw.task as object), ...(edits.task as object | undefined) } });
+    if (!parsed.ok) throw new Error(parsed.problems.join("\n"));
+    return parsed.record;
+  };
+  const records = (): NightRecord[] => [
+    variant("sample-shipped.json", {
+      task: { id: "#3" },
+      pullRequest: { number: 5, url: "https://github.com/o/r/pull/5", headSha: SHA },
+      runs: [{ id: 6, url: "https://github.com/o/r/actions/runs/6", headSha: SHA, endedLabel: "agent-done" }],
+    }),
+    variant("sample-blocked.json", { task: { id: "#4" } }),
+    variant("sample-shipped.json", { outcome: "awaiting_merge", task: { id: "#2" } }),
+    variant("sample-escalated.json", { task: { id: "#1" } }),
+  ];
+
+  it("states the generation time and window, then lists sections in order", () => {
+    const digest = renderNightDigest(records(), context);
+    const headings = digest.split("\n").filter((line) => line.startsWith("## "));
+
+    expect(digest.split("\n")[0]).toBe("# Morning report: 2026-11-24");
+    expect(digest).toContain(
+      "Generated 2026-11-24T16:00:00.000Z for agent runs from 2026-11-24T00:00:00.000Z to 2026-11-24T15:20:00.000Z. Everything below is as of the generation time.",
+    );
+    expect(digest).toContain("Runs that found no issue to work on: [8](<https://github.com/o/r/actions/runs/8>).");
+    expect(headings).toEqual(["## Needs your answer", "## Ready to merge", "## Shipped", "## Blocked", "## Unknown"]);
+  });
+
+  it("each item has its verdict, PR link with head, checks, review and run links", () => {
+    const digest = renderNightDigest(records(), context);
+
+    expect(digest).toContain("- **Pull request:** [#5](<https://github.com/o/r/pull/5>) at ab55eb8");
+    expect(digest).toContain("- **Runs:** [6](<https://github.com/o/r/actions/runs/6>) ended agent-done on ab55eb8");
+    expect(digest).toMatch(/- \*\*Review:\*\* Approved by .+ \(\d+ open findings?\)/);
+    expect(digest).toMatch(/- \*\*Checks:\*\* (PASS|FAIL) /);
+    expect(digest).toContain("**Ready to merge.** The change was approved in review and passed every check; a person decides whether to merge it.");
+    expect(digest).toContain("### #9: Something # odd");
+    expect(digest).toContain('- **Missing evidence:** no "Node 24" check run on ab55eb8');
+  });
+
+  it("says when nothing happened", () => {
+    expect(renderNightDigest([], { ...context, unknowns: [], idleRuns: [] })).toContain("No agent worked on an issue in this window.");
+  });
+
+  it("renderMorningReport still renders one record, including awaiting_merge", () => {
+    const report = renderMorningReport(variant("sample-shipped.json", { outcome: "awaiting_merge" }));
+    expect(report.split("\n")[2]).toBe(
+      "**Ready to merge.** The change was approved in review and passed every check; a person decides whether to merge it.",
+    );
   });
 });

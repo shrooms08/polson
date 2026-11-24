@@ -18,6 +18,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runReport } from "../src/cli.js";
 import { fixturePath, loadRawFixture } from "./fixtures.js";
+import { loadRecording, replay } from "./support/replay-github.js";
 
 describe("report CLI", () => {
   let cwd: string;
@@ -250,7 +251,7 @@ describe("report CLI", () => {
         const code = await runReport([fixturePath("sample-escalated.json"), flag], io());
 
         expect(code).toBe(1);
-        expect(err).toContain(`Unknown option: ${flag}. Known options: --force, --dry-run, --help.`);
+        expect(err).toContain(`Unknown option: ${flag}. Known options: --force, --dry-run, --help, --from-github, --since, --until.`);
         expect(err).toContain("Usage: npm run report --");
         expect(out).toBe("");
         expect(existsSync(join(cwd, "reports"))).toBe(false);
@@ -309,4 +310,104 @@ describe("report CLI entry point", () => {
       rmSync(cwd, { recursive: true, force: true });
     }
   }, TEST_TIMEOUT_MS);
+});
+
+// Gap 4, phase 1: --from-github builds the night's digest from recorded gh/qodo
+// responses (fixtures/github/2026-11-24.json) instead of a record file.
+describe("report CLI --from-github", () => {
+  let cwd: string;
+  let out: string;
+  let err: string;
+  const DAY = loadRecording("2026-11-24.json");
+  const NOW = new Date("2026-11-25T08:00:00Z");
+  const io = (exec = replay(DAY)) => ({
+    cwd,
+    out: (text: string) => void (out += text),
+    err: (text: string) => void (err += text),
+    exec,
+    now: () => NOW,
+  });
+  const WINDOW = ["--from-github", "--since", "2026-11-24T00:00:00Z", "--until", "2026-11-24T15:20:00Z"];
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), "polson-cli-github-"));
+    out = "";
+    err = "";
+  });
+
+  afterEach(() => rmSync(cwd, { recursive: true, force: true }));
+
+  it("prints the digest and writes it to reports/<Lagos date of --until>.md", async () => {
+    expect(await runReport(WINDOW, io())).toBe(0);
+
+    expect(out).toContain("# Morning report: 2026-11-24");
+    expect(out).toContain("Generated 2026-11-25T08:00:00.000Z for agent runs from 2026-11-24T00:00:00.000Z to 2026-11-24T15:20:00.000Z.");
+    expect(out).toContain("## Ready to merge");
+    expect(readFileSync(join(cwd, "reports", "2026-11-24.md"), "utf8")).toBe(out);
+    expect(err).toContain("Wrote reports/2026-11-24.md");
+  });
+
+  it("--dry-run prints the digest and writes nothing", async () => {
+    expect(await runReport([...WINDOW, "--dry-run"], io())).toBe(0);
+
+    expect(out).toContain("## Ready to merge");
+    expect(err).toContain("Dry run: nothing was written. A real run would write reports/2026-11-24.md.");
+    expect(existsSync(join(cwd, "reports"))).toBe(false);
+  });
+
+  it("never replaces an existing report without --force", async () => {
+    expect(await runReport(WINDOW, io())).toBe(0);
+    const first = readFileSync(join(cwd, "reports", "2026-11-24.md"), "utf8");
+    out = "";
+    err = "";
+
+    expect(await runReport(WINDOW, io())).toBe(1);
+    expect(err).toContain("reports/2026-11-24.md already exists, so it was not overwritten.");
+    expect(readFileSync(join(cwd, "reports", "2026-11-24.md"), "utf8")).toBe(first);
+    expect(await runReport([...WINDOW, "--force"], io())).toBe(0);
+  });
+
+  it("defaults the window to the 24 hours before now", async () => {
+    const calls: string[] = [];
+    const exec = replay({ ...DAY }, calls);
+    // The recording covers 24 Nov only, so ask for a window inside it.
+    const code = await runReport(["--from-github", "--until", "2026-11-24T23:59:59Z", "--dry-run"], {
+      ...io(exec),
+      now: () => new Date("2026-11-24T23:59:59Z"),
+    });
+
+    expect(err).toContain("outside the recording");
+    expect(code).toBe(1);
+    expect(calls.find((call) => call.includes("/actions/workflows/polson-agent.yml/runs?created="))).toContain(
+      "created=2026-11-23T23:59:59Z..2026-11-24T23:59:59Z",
+    );
+  });
+
+  it("evidence it cannot read: exit 1, nothing written", async () => {
+    const failing = async () => {
+      throw new Error("gh api failed: HTTP 502");
+    };
+    expect(await runReport(WINDOW, io(failing))).toBe(1);
+
+    expect(err).toContain("Could not read the evidence from GitHub: gh api failed: HTTP 502");
+    expect(err).toContain("No report was written.");
+    expect(out).toBe("");
+    expect(existsSync(join(cwd, "reports"))).toBe(false);
+  });
+
+  it.each([
+    [["--from-github", "--since", "yesterday"], "--since must be an ISO timestamp with a time zone"],
+    [["--from-github", "--until", "2026-11-24T10:00:00"], "--until must be an ISO timestamp with a time zone"],
+    [["--from-github", "--since", "2026-11-24T10:00:00Z", "--until", "2026-11-24T09:00:00Z"], "--since must be before --until."],
+    [["--from-github", "--since"], "Option --since needs a value"],
+    [["--since", "2026-11-24T00:00:00Z"], "--since and --until need --from-github."],
+    [["--from-github", "record.json"], "--from-github takes no record path."],
+  ])("rejects %j", async (args, message) => {
+    const calls: string[] = [];
+    expect(await runReport(args, io(replay(DAY, calls)))).toBe(1);
+
+    expect(err).toContain(message);
+    expect(calls).toEqual([]);
+    expect(existsSync(join(cwd, "reports"))).toBe(false);
+  });
 });
