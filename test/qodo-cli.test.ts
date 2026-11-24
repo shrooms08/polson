@@ -80,7 +80,12 @@ describe("qodo-cli.sh install", () => {
     });
   }
 
-  it("installs the pinned CLI version into QODO_HOME", () => {
+  // Measured 38-51 ms (alone and in the full suite), so this is not slow work. It runs
+  // the real script, which spawns about 8 short processes (bash, env, curl stand-in,
+  // sha256sum, timeout, sh, qodo), and that cannot be avoided without changing what
+  // is tested. It once took 5111 ms against the 5000 ms default while the machine was
+  // busy (issue #51). The explicit 30 s gives load headroom; the global timeout is unchanged.
+  it("installs the pinned CLI version into QODO_HOME", { timeout: 30_000 }, () => {
     const r = install();
 
     expect(r.status, r.stderr).toBe(0);
