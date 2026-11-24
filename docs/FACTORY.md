@@ -105,6 +105,15 @@ flowchart TD
   MG["A person merges with gh pr merge.<br/>protect-main: a PR and both CI checks,<br/>no force push or deletion, no bypass<br/>USED: PR #11, PR #19, PR #24"]
   HD -- "gate met" --> MG --> MAIN["main"]
 
+  subgraph SEC["Security scan lane (Arnica, Day 16)"]
+    MIR["Mirror polson-factory/polson, an exact copy of main<br/>Actions disabled<br/>USED: first sync 24 Nov 2026, 3516570"]
+    ARN["Arnica scan: SCA, License, SAST<br/>scan-only: no PR blocking, no comments, no repo writes<br/>USED: first scan 24 Nov 2026 on 3516570"]
+    TR["Owner triages each finding (rule 4: prove it first)<br/>USED: 14 Medium findings"]
+    FX["Fix through an owner PR<br/>USED: PR #50"]
+    SG["CI + Qodo gate on the fix<br/>USED: PR #50"]
+  end
+  MAIN -- "owner syncs, manual" --> MIR --> ARN --> TR --> FX --> SG --> MAIN
+
   INVA["Codebase Wisdom inside the agent run<br/>PLANNED"]
   LRA["Qodo local review inside the agent run<br/>PLANNED"]
   NR["Night record and morning report from each run<br/>PLANNED: code in src/, not run by the workflow"]
@@ -120,6 +129,7 @@ flowchart TD
   class WD,SW,AGE,HO,HJ built
   class INVA,LRA,NR planned
   class QW,QG used
+  class MIR,ARN,TR,FX,SG used
 ```
 
 ## Gates
@@ -226,6 +236,15 @@ Each gate says what must pass, the evidence it uses, what happens on failure, an
 | On failure | GitHub refuses the push or merge. |
 | Who decides | GitHub, as configured by the owner. It does not check Qodo, approvals (0 required), or whether the branch is up to date with `main`. |
 
+## Security scan (Arnica, Day 16)
+
+- **Why a mirror:** Arnica supports organisation-owned repositories only. `polson-factory/polson` is an exact mirror of `main`, pushed by the owner by hand, with GitHub Actions disabled so the push runs no workflow.
+- **First scan** (24 Nov 2026, on `3516570`): 14 findings, all Medium.
+  - **12 License:** `lightningcss@1.33.0` and its platform binaries, MPL-2.0. Dev-only: `vitest` → `vite` → `lightningcss`; `npm ls lightningcss --omit=dev` is empty. Dismissed: the risk is tolerable.
+  - **2 SAST, "Excessive workflow permission assignment"** in `.github/workflows/polson-agent.yml`. The workflow-level `permissions:` block applied only to the `agent` job; the other three jobs declare their own.
+- **Line 60, `contents: write`: valid.** The workflow token never wrote contents or pull requests; the agent pushes and opens PRs with the Claude GitHub App token from claude-code-action's OIDC exchange. Fixed in PR #50: the `agent` job's token is now `contents: read` and `pull-requests: read` (with `issues: write`, `id-token: write`, `actions: read`, `checks: read`), and the workflow level is `permissions: {}`. Proven by run 45364906717: the agent pushed its branch and opened PR #52 with the Claude App token (author `app/claude`), and no step got a 403.
+- **Line 68, `id-token: write`: required** for the action's OIDC exchange; without it the action cannot authenticate. Dismissed: risk accepted.
+
 ## Status of every step
 
 | Step | Status | Proof |
@@ -270,6 +289,7 @@ Each gate says what must pass, the evidence it uses, what happens on failure, an
 | Qodo local review inside the agent run | PLANNED | |
 | Qodo workflow adds "Qodo approved" when no Medium+ finding | USED | PR #46 (#44, outside the guard): no label on 8894d11 while a Medium was open; after the fix, `Qodo approved` added by `qodo-code-review[bot]` at 08:09:11Z on 8a59478 (complete lite review, Medium implemented, Low outdated). No PR review or approval came with it. |
 | Approval guard: `.github/**` changes get no label, a person approves | USED | PR #45 (#36, `.github/polson/`): complete standard review of f718662 with no open findings, and no label, while the same workflow labelled PR #46. The guard's decision itself is not visible in Qodo's portal (PR Triage) or the CLI, so the evidence is the label's absence. |
+| Security scan lane: mirror, Arnica scan, owner triage, fix through an owner PR | USED | First scan 24 Nov 2026 on `3516570`: 14 Medium findings; the valid SAST finding fixed in PR #50, proven by run 45364906717 |
 | Night record and morning report from each run | PLANNED | `src/night-record.ts` and `src/morning-report.ts` exist; no workflow step writes a record |
 
 ## Walkthrough: issue #23
@@ -328,3 +348,7 @@ Each gate says what must pass, the evidence it uses, what happens on failure, an
 12. **`review_complete=false` can stick on a PR; such PRs escalate to a person by design.** In Qodo's record for PRs #1 to #27, 4 of 31 non-skip runs had it, all on PR #20 and PR #27, and once a PR had it every later run did too. `verify-qodo` treats it as not reviewed (rule 6, and Qodo's guidance requires `review_complete=true`).
 13. **Agent transcripts are kept only on failure or escalation, as summaries.** BUILT, not yet run for real. After each agent step, `keep-transcript.sh` keeps what the agent did: its text, its tool calls, failed or refused calls (cut to 300 characters), and the final result with its refused calls. It drops tool output, because the repository is public and any signed-in GitHub user can download its artifacts, and then redacts known credential formats. The agent job uploads the summaries (7-day retention) whenever the run ends without candidate-done. A step cut off at its time limit gets a partial summary from Claude Code's own session log, because the action writes its transcript only when the session ends. Not covered: a run that reached candidate-done and was then escalated by `verify-qodo`, since the agent job ends before that decision. Error text can still quote command output, and redaction only knows common formats.
 14. **Qodo's "⊘ Outdated" mark made a clean review unreadable. FIXED by #47 (PR #48).** On PR #46 (8a59478) Qodo listed a resolved Medium and an outdated Low under "Resolved findings". `qodo-open-findings.sh` knew only Resolved and Dismissed, so `wait-for-pr.sh` printed `open_high_medium=unknown` on 25 polls while Qodo's record showed nothing open. Outdated now closes a finding in the resolved section only; any other mark there, or Outdated elsewhere, is still unknown (rule 6).
+15. **The mirror sync is manual, so the scan can lag `main`.** The owner pushes `main` to `polson-factory/polson` by hand; findings describe the commit last pushed, not necessarily the current `main`.
+16. **Arnica is not a merge gate.** It is scan-only by choice: no PR blocking, no comments, no repository writes. A finding reaches `main` only if the owner triages it and fixes it through a PR.
+17. **Open: is `ACTIONS_ID_TOKEN_REQUEST_TOKEN` reachable by agent-run code?** The `agent` job needs `id-token: write`, so every step can request OIDC tokens, including code the agent writes and runs under `npm test`. Not yet checked whether claude-code-action removes it from the agent's environment.
+18. **The agent's tool allowlist has no way to run a single test file.** Run 45364906717 escalated #51: the agent's `npx vitest` calls were refused, so it could not measure the test or reproduce Qodo's findings on PR #52.
