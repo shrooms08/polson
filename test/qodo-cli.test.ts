@@ -80,10 +80,10 @@ describe("qodo-cli.sh install", () => {
     });
   }
 
-  // Measured 38-51 ms locally (alone and in the full suite). It runs the real script,
-  // which spawns about 8 short processes (bash, env, curl stand-in, sha256sum, timeout,
-  // sh, qodo). It once took 5111 ms in CI against the 5000 ms default (issue #51); that
-  // run was not reproduced and its cause is unknown (no per-process timings were taken).
+  // Measured: 38-51 ms on the agent's GitHub runner and about 1.8 s on a macOS dev machine.
+  // It runs the real script, which starts several short processes.
+  // It once took 5111 ms in a local full-suite run during PR #50 validation (issue #51),
+  // against the 5000 ms default; that run was not reproduced and its cause is unknown.
   // The explicit 30 s keeps one slow run from failing the test; the global timeout is unchanged.
   it("installs the pinned CLI version into QODO_HOME", { timeout: 30_000 }, () => {
     const r = install();
